@@ -1,0 +1,158 @@
+name: Build Unsigned IPA
+
+# Produces an UNSIGNED device .ipa for sideloading (AltStore / Sideloadly / TrollStore).
+# The upstream "Build iOS" workflow only builds for the Simulator, which cannot be
+# installed on a real iPhone — this one builds for -sdk iphoneos instead.
+#
+# Run it from the Actions tab:  Actions -> Build Unsigned IPA -> Run workflow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    env:
+      APP_NAME: Audiobookshelf
+      SCHEME: App
+      WORKSPACE: App.xcworkspace
+      CONFIGURATION: Release
+      # Release uses the production icon set; the Debug config uses "IconsDebug"
+      # and the bundle id com.audiobookshelf.app.dev instead.
+      ICON_SET: Icons
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Report toolchain versions
+        run: |
+          echo "xcode-select: $(xcode-select -p)"
+          xcodebuild -version
+          pod --version
+          node --version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci --omit=optional
+
+      - name: Build shared web app (nuxt generate)
+        run: npm run generate
+
+      - name: Sync Capacitor iOS project
+        run: npx cap sync ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install
+
+      - name: Build device app without code signing
+        working-directory: ios/App
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace "${WORKSPACE}" \
+            -scheme "${SCHEME}" \
+            -configuration "${CONFIGURATION}" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ASSETCATALOG_COMPILER_APPICON_NAME="${ICON_SET}" \
+            build
+
+      - name: Verify the product targets a real device
+        working-directory: ios/App
+        run: |
+          set -euo pipefail
+          APP_PATH="build/Build/Products/${CONFIGURATION}-iphoneos/${APP_NAME}.app"
+          if [ ! -d "${APP_PATH}" ]; then
+            echo "::error::Build product not found at ${APP_PATH}"
+            echo "--- products that do exist ---"
+            find build/Build/Products -maxdepth 2 -name '*.app' || true
+            exit 1
+          fi
+
+          BIN="${APP_PATH}/${APP_NAME}"
+          file "${BIN}"
+          lipo -info "${BIN}"
+
+          # An ipa that only carries a simulator slice is useless for sideloading.
+          if ! lipo -info "${BIN}" | grep -q 'arm64'; then
+            echo "::error::Built binary has no arm64 device slice"
+            exit 1
+          fi
+
+          echo "Deployment target: $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "${APP_PATH}/Info.plist" 2>/dev/null || echo 'n/a')"
+          echo "Bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${APP_PATH}/Info.plist")"
+
+      - name: Package as .ipa
+        working-directory: ios/App
+        run: |
+          set -euo pipefail
+          APP_PATH="build/Build/Products/${CONFIGURATION}-iphoneos/${APP_NAME}.app"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          IPA_NAME="audiobookshelf-unsigned-${SHORT_SHA}.ipa"
+
+          rm -rf ipa
+          mkdir -p ipa/Payload
+          cp -R "${APP_PATH}" ipa/Payload/
+
+          ( cd ipa && zip -qry "../${IPA_NAME}" Payload )
+
+          echo "IPA_NAME=${IPA_NAME}" >> "${GITHUB_ENV}"
+          echo "Built ${IPA_NAME} ($(du -h "${IPA_NAME}" | cut -f1))"
+
+      - name: List ipa contents and checksum
+        working-directory: ios/App
+        run: |
+          unzip -l "${IPA_NAME}" | head -n 30
+          echo "---"
+          shasum -a 256 "${IPA_NAME}"
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiobookshelf-unsigned-ipa
+          path: ios/App/*.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Unsigned IPA ready"
+            echo ""
+            echo "Download the **audiobookshelf-unsigned-ipa** artifact above, unzip it to get the \`.ipa\`."
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| bundle id | \`com.audiobookshelf.app\` |"
+            echo "| configuration | \`Release\` |"
+            echo "| architecture | \`arm64\` |"
+            echo "| minimum iOS | 14.0 |"
+            echo "| signature | none — you sign it when installing |"
+            echo ""
+            echo "Install with AltStore, Sideloadly or TrollStore."
+            echo "Free Apple ID sideloads expire after 7 days and must be re-signed."
+          } >> "${GITHUB_STEP_SUMMARY}"
